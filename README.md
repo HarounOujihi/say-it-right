@@ -5,16 +5,30 @@ Arabic pronunciation assessment tool. Compare expected phonemes (from text) agai
 ## Quick Start
 
 ```bash
-# 1. Activate the virtual environment
+# 1. Clone
+git clone git@github.com:HarounOujihi/say-it-right.git
+cd say-it-right
+
+# 2. Create + activate virtual environment
+python3 -m venv venv
 source venv/bin/activate
 
-# 2. Run the interactive CLI
+# 3. Install Python dependencies
+pip install -r requirements.txt
+
+# 4. Install CAMeL Tools data (~36 MB)
+camel_data -i light
+
+# 5. Run the interactive CLI
 python cli.py
 ```
 
-Or use the wrapper script:
+First run downloads the wav2vec2 model (~1.2 GB) from HuggingFace Hub into `~/.cache/huggingface/`. To avoid that, see [Installation](#installation-fresh-setup) below.
+
+Or use the wrapper script (after step 4):
 
 ```bash
+chmod +x start.sh stop.sh
 ./start.sh            # interactive CLI (default)
 ./start.sh api        # API server on port 8000
 ./start.sh test       # batch tests
@@ -231,28 +245,43 @@ say-it-right/
 ├── start.sh                  # Unified entry point
 ├── stop.sh                   # Stop any running process
 ├── requirements.txt          # Python dependencies
-├── model_cache/              # wav2vec2 model weights (local, ~1.2 GB)
-├── test_audio/               # Place WAV files here
-├── results/                  # JSON output from tests
-└── venv/                     # Python virtual environment
+├── model_cache/              # wav2vec2 model weights (~1.2 GB)  [gitignored]
+├── test_audio/               # Place WAV files here              [gitignored]
+├── results/                  # JSON output from tests            [gitignored]
+└── venv/                     # Python virtual environment        [gitignored]
 ```
+
+Files marked `[gitignored]` are not in the repo — they are created during [Installation](#installation-fresh-setup).
 
 ## Installation (Fresh Setup)
 
+After cloning, `venv/`, `model_cache/`, `test_audio/`, and `results/` do **not** exist (they are gitignored). This section sets everything up from scratch.
+
 ```bash
-# 1. Create virtual environment
+# 1. Clone the repository
+git clone git@github.com:HarounOujihi/say-it-right.git
+cd say-it-right
+
+# 2. Make scripts executable (Git doesn't always preserve the +x bit)
+chmod +x start.sh stop.sh
+
+# 3. Create + activate virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
-# 2. Install dependencies
+# 4. Install Python dependencies
 pip install -r requirements.txt
 
-# 3. Install CAMeL Tools data
+# 5. Install CAMeL Tools data (~36 MB, stored in ~/.camel_tools)
 camel_data -i light
 
-# 4. Download model (if not using HF Hub auto-download)
-mkdir -p model_cache
-cd model_cache
+# 6. Create runtime directories (gitignored, not in repo)
+mkdir -p test_audio results
+
+# 7. Download the wav2vec2 model (~1.2 GB)
+#    Option A — let the engine auto-download on first run (goes to ~/.cache/huggingface/)
+#    Option B — pre-download into model_cache/ (auto-detected, skips HF Hub):
+mkdir -p model_cache && cd model_cache
 curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/resolve/main/model.safetensors
 curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/resolve/main/config.json
 curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/resolve/main/processor_config.json
@@ -261,6 +290,8 @@ curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/reso
 curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/resolve/main/added_tokens.json
 cd ..
 ```
+
+If the `curl` download stalls, add `--retry 30 --retry-delay 5 --retry-all-errors -C -` to resume.
 
 ### System Requirements (Fedora)
 

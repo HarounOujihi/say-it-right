@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 import warnings
 
+from phrasebook import lookup as phrasebook_lookup, save_entry as phrasebook_save
+
 warnings.filterwarnings("ignore")
 
 
@@ -83,6 +85,10 @@ class PronunciationEngine:
         """Convert Arabic text to phonemes using CAMeL Tools MLE Disambiguator.
 
         Uses the caphi (camel phonetic) feature from morphological analysis.
+
+        Note: output includes case endings (i'rāb) which are often dropped
+        in normal speech. Use get_target_phonemes() for the phrasebook-aware
+        path, or pass a corrected list to assess_with_target().
         """
         try:
             text = self._normalize_arabic_text(text)
@@ -216,31 +222,60 @@ class PronunciationEngine:
         return errors, total_errors, accuracy
 
     # ------------------------------------------------------------------ #
+    #  Phrasebook-aware target lookup
+    # ------------------------------------------------------------------ #
+
+    def get_target_phonemes(self, text, use_phrasebook=True):
+        """Resolve target phonemes for a text.
+
+        Order of resolution:
+          1. If use_phrasebook=True and text is in phrasebook.json,
+             return the user-corrected list (skips G2P entirely).
+          2. Otherwise, fall back to CAMeL MLE G2P.
+
+        Returns:
+            (phonemes, source) where source is "phrasebook" or "g2p".
+        """
+        if use_phrasebook:
+            saved = phrasebook_lookup(text)
+            if saved is not None:
+                return list(saved), "phrasebook"
+        return self.text_to_phonemes(text), "g2p"
+
+    def save_target(self, text, phonemes):
+        """Persist a corrected target phoneme list to the phrasebook."""
+        phrasebook_save(text, phonemes)
+
+    # ------------------------------------------------------------------ #
     #  Full assessment
     # ------------------------------------------------------------------ #
 
-    def assess(self, text, audio_path, verbose=True):
-        """Run the full assessment pipeline.
+    def assess(self, text, audio_path, verbose=True, use_phrasebook=True):
+        """Run the full assessment pipeline (text → G2P → compare).
 
         Args:
-            text:       Arabic text (target pronunciation).
-            audio_path: Path to WAV file of the user's pronunciation.
-            verbose:    Print step-by-step results.
+            text:           Arabic text (target pronunciation).
+            audio_path:     Path to WAV file of the user's pronunciation.
+            verbose:        Print step-by-step results.
+            use_phrasebook: If True and text is in phrasebook.json, use the
+                            saved phoneme list instead of running G2P.
 
         Returns:
             dict with keys:
                 text, audio_path, target_phonemes, recognized_phonemes,
                 accuracy, errors (substitutions/insertions/deletions),
-                total_errors
+                total_errors, target_source
         """
         log = (lambda msg: print(msg)) if verbose else (lambda msg: None)
 
         log(f"\nAssessing pronunciation for: '{text}'")
         log(f"Audio file: {audio_path}")
 
-        log("Step 1: Converting text to phonemes...")
-        target_phonemes = self.text_to_phonemes(text)
-        log(f"  Target phonemes: {target_phonemes}")
+        log("Step 1: Resolving target phonemes...")
+        target_phonemes, target_source = self.get_target_phonemes(
+            text, use_phrasebook=use_phrasebook
+        )
+        log(f"  Target phonemes ({target_source}): {target_phonemes}")
 
         log("Step 2: Recognizing phonemes from audio...")
         recognized_phonemes = self.audio_to_phonemes(audio_path)
@@ -283,4 +318,72 @@ class PronunciationEngine:
                 "deletions": errors["deletions"],
             },
             "total_errors": total_errors,
+            "target_source": target_source,
+        }
+
+    def assess_with_target(self, target_phonemes, audio_path, text="", verbose=True):
+        """Assess using an explicit target phoneme list (skips G2P entirely).
+
+        Use this when the user has manually corrected the target phonemes
+        and wants to compare audio against the corrected list.
+
+        Args:
+            target_phonemes: List of phoneme strings (the corrected target).
+            audio_path:      Path to WAV file of the user's pronunciation.
+            text:            Optional original text (for record-keeping only).
+            verbose:         Print step-by-step results.
+
+        Returns:
+            Same dict shape as assess(), with target_source="manual".
+        """
+        log = (lambda msg: print(msg)) if verbose else (lambda msg: None)
+
+        log(f"\nAssessing pronunciation (manual target)")
+        log(f"Audio file: {audio_path}")
+
+        log("Step 1: Using provided target phonemes...")
+        log(f"  Target phonemes (manual): {target_phonemes}")
+
+        log("Step 2: Recognizing phonemes from audio...")
+        recognized_phonemes = self.audio_to_phonemes(audio_path)
+        log(f"  Recognized phonemes: {recognized_phonemes}")
+
+        log("Step 3: Comparing phonemes...")
+        errors, total_errors, accuracy = self.compare_phonemes(
+            target_phonemes, recognized_phonemes
+        )
+
+        if verbose:
+            correct = len(target_phonemes) - len(errors["substitutions"]) - len(errors["deletions"])
+            print("\n" + "=" * 50)
+            print("ASSESSMENT RESULTS")
+            print("=" * 50)
+            print(f"Accuracy: {accuracy:.2f}%")
+            print(f"Correct phonemes: {correct}/{len(target_phonemes)}")
+            print(f"Errors: {total_errors}")
+            print(f"  - Substitutions: {len(errors['substitutions'])}")
+            if errors["substitutions"]:
+                for tgt, rec in errors["substitutions"]:
+                    print(f"      {tgt} -> {rec}")
+            print(f"  - Insertions: {len(errors['insertions'])}")
+            if errors["insertions"]:
+                print(f"      {errors['insertions']}")
+            print(f"  - Deletions: {len(errors['deletions'])}")
+            if errors["deletions"]:
+                print(f"      {errors['deletions']}")
+            print("=" * 50)
+
+        return {
+            "text": text,
+            "audio_path": audio_path,
+            "target_phonemes": target_phonemes,
+            "recognized_phonemes": recognized_phonemes,
+            "accuracy": round(accuracy, 2),
+            "errors": {
+                "substitutions": errors["substitutions"],
+                "insertions": errors["insertions"],
+                "deletions": errors["deletions"],
+            },
+            "total_errors": total_errors,
+            "target_source": "manual",
         }

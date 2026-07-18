@@ -37,12 +37,16 @@ chmod +x start.sh stop.sh
 ## How It Works
 
 ```
-Arabic Text ──► CAMeL Tools MLE ──► Target Phonemes ─┐
-                   (G2P)              k i t aa b i    │
-                                                      ├─► Edit Distance ──► Accuracy %
-Audio WAV ────► wav2vec2 CTC ────► Recognized Phonemes┘
-                                  k i t aa b
+                       ┌── phrasebook.json (if entry exists) ──┐
+Arabic Text ──┼────────┤                                        ├─► Target Phonemes ─┐
+              │        └── CAMeL Tools MLE (G2P fallback) ──────┘                    │
+              │                                                                     ├─► Edit Distance ──► Accuracy %
+              │                                                  Target Phonemes ──┘
+              │                                                  (user-corrected)
+Audio WAV ────┼──► wav2vec2 CTC ────► Recognized Phonemes ──────────────────────────┘
 ```
+
+**Target resolution order:** phrasebook (user-corrected) → CAMeL G2P (auto-generated) → manual override (caller-provided). See [Manual Target & Phrasebook](#manual-target--phrasebook) below.
 
 1. **Text to phonemes (G2P)** — Arabic text is morphologically analyzed via CAMeL Tools MLE Disambiguator (`calima-msa-r13`), producing phonemes from the `caphi` field (e.g. `كتاب` → `k i t aa b i`).
 2. **Audio to phonemes (ASR)** — A wav2vec2 model (`MostafaMaroof/wav2vec2-arabic-phoneme-asr`) recognizes phonemes from the recorded audio using CTC decoding.
@@ -113,6 +117,66 @@ Run multiple test cases defined in `test_pronunciation.py`:
 ```bash
 ./start.sh test
 ```
+
+## Manual Target & Phrasebook
+
+CAMeL's G2P sometimes produces phonemes that don't match natural speech — most commonly **case endings** (i`rāb). For example, `كتاب` (kitāb) is spoken as `k i t aa b`, but CAMeL outputs `k i t aa b i` (with a trailing genitive `i`).
+
+Say It Right lets you override the target phonemes in three ways:
+
+### Option A — Pass a manual target (one-off)
+
+```bash
+# CLI: skip G2P entirely, provide your own phoneme list
+python cli.py --audio clip.wav --target "k,i,t,aa,b"
+
+# API: same thing via form field
+curl -X POST http://localhost:8000/assess \
+  -F "target=k,i,t,aa,b" \
+  -F "audio=@test_audio/clip.wav"
+```
+
+### Option B — Edit interactively, save to phrasebook
+
+```bash
+# Show auto-generated target, edit in $EDITOR, save for future runs
+python cli.py --text "كتاب" --audio clip.wav --edit-target --save-target
+```
+
+The corrected list is persisted to `phrasebook.json`:
+
+```json
+{
+  "كتاب": ["k", "i", "t", "aa", "b"]
+}
+```
+
+### Option C — Two-step via API (for web/mobile clients)
+
+```bash
+# Step 1: generate
+curl "http://localhost:8000/phonemes?text=كتاب"
+# → {"phonemes":["k","i","t","aa","b","i"],"source":"g2p"}
+
+# Step 2: user edits on the client side, then saves
+curl -X POST http://localhost:8000/phonemes \
+  -F "text=كتاب" -F "phonemes=k,i,t,aa,b"
+# → {"status":"saved"}
+
+# Subsequent /assess calls with text=كتاب now auto-use the phrasebook entry
+```
+
+### How phrasebook lookup works
+
+Every `assess(text=...)` call checks `phrasebook.json` **first**. If the text is found, the saved phoneme list is used and G2P is skipped entirely. The response includes `"target_source"` so you know which path was taken:
+
+| `target_source` | Meaning |
+|-----------------|---------|
+| `"g2p"` | CAMeL MLE generated the target (no phrasebook entry) |
+| `"phrasebook"` | Used a previously saved correction from `phrasebook.json` |
+| `"manual"` | Caller passed an explicit `target` list this time |
+
+The browser UI at `http://localhost:8000/` has a **"Get Phonemes"** button to auto-generate, an editable field to correct, and a **"Save to Phrasebook"** button to persist.
 
 ## Recording Audio
 
@@ -220,13 +284,16 @@ Accuracy = `(1 - total_errors / len(target_phonemes)) * 100`
 
 ```
 pronunciation_engine.py   ← Core logic (PronunciationEngine class)
-                              ├─ text_to_phonemes()   — CAMeL MLE → caphi
-                              ├─ audio_to_phonemes()  — soundfile + wav2vec2
-                              ├─ compare_phonemes()   — edit distance
-                              └─ assess()             — full pipeline
+                              ├─ text_to_phonemes()      — CAMeL MLE → caphi
+                              ├─ get_target_phonemes()   — phrasebook → G2P fallback
+                              ├─ assess_with_target()    — manual target (skip G2P)
+                              ├─ audio_to_phonemes()     — soundfile + wav2vec2
+                              ├─ compare_phonemes()      — edit distance
+                              └─ assess()                — full pipeline
 │
-├── cli.py                ← Interactive + one-liner CLI (argparse)
-├── api.py                ← FastAPI server + browser UI
+├── phrasebook.py         ← JSON-backed user corrections (load/save/lookup)
+├── cli.py                ← Interactive + one-liner CLI (--target, --edit-target)
+├── api.py                ← FastAPI server (/assess, /phonemes, browser UI)
 ├── test_pronunciation.py ← Batch test runner
 └── record_audio.py       ← Microphone recording helper
 ```
@@ -238,6 +305,7 @@ All three interfaces (CLI, API, batch test) import and share the same `Pronuncia
 ```
 say-it-right/
 ├── pronunciation_engine.py   # Core assessment logic (shared)
+├── phrasebook.py             # User-corrected phoneme lookup/save
 ├── cli.py                    # Interactive + one-liner CLI
 ├── api.py                    # FastAPI server with browser UI
 ├── test_pronunciation.py     # Batch test runner
@@ -248,6 +316,7 @@ say-it-right/
 ├── model_cache/              # wav2vec2 model weights (~1.2 GB)  [gitignored]
 ├── test_audio/               # Place WAV files here              [gitignored]
 ├── results/                  # JSON output from tests            [gitignored]
+├── phrasebook.json           # User-corrected phoneme targets    [gitignored]
 └── venv/                     # Python virtual environment        [gitignored]
 ```
 

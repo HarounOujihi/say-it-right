@@ -22,6 +22,9 @@ dist/
 test_audio/
 results/
 
+# User-corrected phoneme phrasebook
+phrasebook.json
+
 # Logs
 *.log
 

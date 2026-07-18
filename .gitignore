@@ -1,0 +1,43 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Model weights (downloaded separately, ~1.2 GB)
+model_cache/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test audio recordings (user-specific)
+test_audio/
+results/
+
+# Logs
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CAMeL Tools data (lives in ~/.camel_tools by default, but just in case)
+camel_tools_data/
+
+# HuggingFace cache (if downloaded locally)
+.cache/

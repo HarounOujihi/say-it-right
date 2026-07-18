@@ -6,23 +6,35 @@ Usage:
   # Interactive mode (prompts for text + audio):
   python cli.py
 
-  # One-liner mode:
+  # One-liner mode (existing audio file):
   python cli.py --text "كتاب" --audio test_audio/clip.wav
 
-  # Record then assess:
+  # No --audio? Target is shown first, then you're prompted to record:
+  python cli.py --text "كتاب"
+  python cli.py --text "كتاب" --target "k i t aa b"
+
+  # Explicit record duration:
   python cli.py --text "كتاب" --record 3
 
   # JSON output (for scripts/piping):
   python cli.py --text "كتاب" --audio clip.wav --json
 
   # Manual target (skip G2P, use your own phoneme list):
-  python cli.py --audio clip.wav --target "k,i,t,aa,b"
+  python cli.py --target "k,i,t,aa,b" --audio clip.wav
 
   # Edit target interactively before assessing:
   python cli.py --text "كتاب" --audio clip.wav --edit-target
 
   # Save corrected target to phrasebook for future runs:
   python cli.py --text "كتاب" --audio clip.wav --edit-target --save-target
+
+  # Get only the target phoneme array (no audio needed):
+  python cli.py --text "كتاب" --phonemes
+
+Flow:
+  1. Resolve target: --target (manual) > phrasebook > CAMeL G2P
+  2. Resolve audio:  --audio (file) > --record N > prompt + countdown
+  3. Assess and print results
 """
 
 import argparse
@@ -34,8 +46,11 @@ from pathlib import Path
 from pronunciation_engine import PronunciationEngine
 
 
-def record_clip(output_path, duration=3.0):
-    """Record audio using record_audio helper."""
+def record_clip(output_path, duration=3.0, countdown=True):
+    """Record audio using record_audio helper.
+
+    If countdown=True, waits for Enter and counts down before recording.
+    """
     try:
         import sounddevice as sd
         import soundfile as sf
@@ -44,6 +59,14 @@ def record_clip(output_path, duration=3.0):
         print("Install with:  pip install sounddevice")
         print("Fedora also needs:  sudo dnf install portaudio-devel")
         sys.exit(1)
+
+    if countdown:
+        input("Press Enter when ready to record... ")
+        import time
+        for i in range(3, 0, -1):
+            print(f"\rRecording in {i}... ", end="", flush=True)
+            time.sleep(1)
+        print("\rRecording now!         ")
 
     sr = 16000
     print(f"Recording {duration}s... (speak now)")
@@ -110,11 +133,14 @@ def main():
         epilog="""
 Examples:
   python cli.py                                          # interactive
-  python cli.py --text "كتاب" --audio clip.wav          # direct
+  python cli.py --text "كتاب"                           # auto-gen target, then record
+  python cli.py --text "كتاب" --target "k i t aa b"     # manual target, then record
+  python cli.py --text "كتاب" --audio clip.wav          # use existing audio
   python cli.py --text "كتاب" --record 3                # record 3s then assess
   python cli.py --text "كتاب" --audio clip.wav --json   # JSON output
-  python cli.py --audio clip.wav --target "k,i,t,aa,b"  # manual target
+  python cli.py --audio clip.wav --target "k,i,t,aa,b"  # manual target, skip G2P
   python cli.py --text "كتاب" --audio clip.wav --edit-target
+  python cli.py --text "كتاب" --phonemes                # print target array only
         """,
     )
     parser.add_argument("--text", "-t", type=str, help="Arabic target text")
@@ -140,12 +166,31 @@ Examples:
         "--save-target", action="store_true",
         help="Save the (possibly edited) target to phrasebook.json for future use",
     )
+    parser.add_argument(
+        "--phonemes", action="store_true",
+        help="Print only the target phoneme array for --text and exit "
+             "(no audio needed). Checks phrasebook first, falls back to G2P.",
+    )
     args = parser.parse_args()
 
     # Determine text and audio source
     text = args.text
     audio_path = args.audio
     manual_target = parse_target_string(args.target) if args.target else None
+
+    # --phonemes: print target array and exit (no audio needed)
+    if args.phonemes:
+        if not text:
+            print("Error: --phonemes requires --text")
+            sys.exit(1)
+        engine = PronunciationEngine(verbose=False)
+        phonemes, source = engine.get_target_phonemes(text)
+        if args.json:
+            print(json.dumps(phonemes, ensure_ascii=False))
+        else:
+            print(" ".join(phonemes))
+            print(f"[source: {source}]", file=sys.stderr)
+        sys.exit(0)
 
     # If no args at all, go interactive
     if (
@@ -178,21 +223,11 @@ Examples:
         else:
             audio_path = input("Enter audio file path: ").strip()
 
-    # Handle --record flag
+    # Handle --record flag (explicit record duration requested)
     elif args.record is not None:
-        if not text:
-            print("Error: --record requires --text")
+        if not text and not manual_target:
+            print("Error: --record requires --text or --target")
             sys.exit(1)
-        audio_path = "test_audio/cli_recording.wav"
-        record_clip(audio_path, args.record)
-
-    # Validate we have audio
-    if not audio_path:
-        print("Error: --audio is required (or use --record)")
-        sys.exit(1)
-    if not os.path.exists(audio_path):
-        print(f"Error: audio file not found: {audio_path}")
-        sys.exit(1)
 
     # Need either text or manual target
     if not text and not manual_target:
@@ -202,32 +237,55 @@ Examples:
     # Initialize engine
     engine = PronunciationEngine(verbose=not args.json)
 
-    # Determine which assessment path to use
+    # Resolve target first (so we can show it before asking user to record)
     if manual_target:
         # Manual target path — skip G2P
+        final_target = manual_target
+        target_source = "manual"
         if args.save_target and text:
             engine.save_target(text, manual_target)
             if not args.json:
                 print(f"Saved target to phrasebook: {text} → {manual_target}")
-        result = engine.assess_with_target(
-            manual_target, audio_path, text=text, verbose=not args.json
-        )
     elif args.edit_target:
         # Edit-target path — show G2P output, let user correct
         if not text:
             print("Error: --edit-target requires --text")
             sys.exit(1)
-        corrected = edit_target_interactively(engine, text)
+        final_target = edit_target_interactively(engine, text)
+        target_source = "manual"
         if args.save_target:
-            engine.save_target(text, corrected)
+            engine.save_target(text, final_target)
             if not args.json:
-                print(f"Saved target to phrasebook: {text} → {corrected}")
-        result = engine.assess_with_target(
-            corrected, audio_path, text=text, verbose=not args.json
-        )
+                print(f"Saved target to phrasebook: {text} → {final_target}")
     else:
-        # Standard path — G2P or phrasebook lookup
-        result = engine.assess(text, audio_path, verbose=not args.json)
+        # Standard path — phrasebook lookup or G2P
+        final_target, target_source = engine.get_target_phonemes(text)
+
+    # Show the resolved target
+    if not args.json:
+        print(f"\nTarget phonemes ({target_source}): {' '.join(final_target)}")
+
+    # Now resolve audio source
+    if args.record is not None:
+        # Explicit --record flag
+        audio_path = "test_audio/cli_recording.wav"
+        record_clip(audio_path, args.record)
+    elif not audio_path:
+        # No --audio and no --record → prompt to record with countdown
+        if args.json:
+            print("Error: --audio or --record is required when using --json")
+            sys.exit(1)
+        audio_path = "test_audio/cli_recording.wav"
+        record_clip(audio_path, duration=3.0, countdown=True)
+
+    if not os.path.exists(audio_path):
+        print(f"Error: audio file not found: {audio_path}")
+        sys.exit(1)
+
+    # Run the assessment with the resolved target
+    result = engine.assess_with_target(
+        final_target, audio_path, text=text or "", verbose=not args.json
+    )
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

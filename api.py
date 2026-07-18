@@ -70,11 +70,16 @@ def _parse_target_string(s):
 
 
 @app.get("/phonemes")
-def get_phonemes(text: str = Query(..., description="Arabic text")):
+def get_phonemes(
+    text: str = Query(..., description="Arabic text"),
+    raw: bool = Query(False, description="If true, return only the bare phoneme array"),
+):
     """Get target phonemes for a text.
 
     Checks phrasebook first, falls back to CAMeL G2P.
     Useful for the two-step workflow: generate → user edits → assess.
+
+    With raw=true, returns just the array: ["k","i","t","aa","b"]
     """
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
@@ -82,6 +87,8 @@ def get_phonemes(text: str = Query(..., description="Arabic text")):
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
     phonemes, source = engine.get_target_phonemes(text)
+    if raw:
+        return JSONResponse(content=phonemes)
     return {"text": text, "phonemes": phonemes, "source": source}
 
 

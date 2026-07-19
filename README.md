@@ -1,6 +1,32 @@
 # Say It Right
 
-Arabic pronunciation assessment tool. Compare expected phonemes (from text) against recognized phonemes (from audio) using CAMeL Tools for grapheme-to-phoneme conversion and wav2vec2 for speech recognition.
+Arabic pronunciation assessment with a **pluggable backend architecture**. Swap ASR models in and out without touching the assessment logic, CLI, or API.
+
+Compare expected phonemes (from text) against recognized phonemes (from audio) and get an accuracy score plus a categorized list of errors (substitutions / insertions / deletions).
+
+---
+
+## The Idea: Modes and Backends
+
+Two orthogonal concepts control how an assessment runs:
+
+- **Mode** — *what kind of pronunciation we're checking.* Defines how text is preprocessed (e.g. should harakat be preserved or stripped?).
+- **Backend** — *which ASR model turns audio into phonemes.* Multiple backends can serve the same mode; you pick one per request.
+
+| Mode       | What it checks                                          | Harakat   | Default backend |
+|------------|---------------------------------------------------------|-----------|-----------------|
+| `everyday` | Casual speech — case endings (i`rāb) optional           | stripped  | `wav2vec2`      |
+| `irab`     | Diacritized / formal speech — case endings matter       | preserved | `tarteel`       |
+
+You can override the backend per-request. Example: even though `tarteel` is the default for `irab`, you could register a second backend (say `nemo`) for the same mode and pick it explicitly:
+
+```bash
+python cli.py --text "كِتَابٌ" --mode irab --backend nemo
+```
+
+The CLI, API, and test runner all honor `--mode` / `--backend`. New backends plug in through a single registry file — see [Adding a New Backend](#adding-a-new-backend) below.
+
+---
 
 ## Quick Start
 
@@ -19,85 +45,87 @@ pip install -r requirements.txt
 # 4. Install CAMeL Tools data (~36 MB)
 camel_data -i light
 
-# 5. Run the interactive CLI
+# 5. Run the interactive CLI (everyday mode by default)
 python cli.py
+
+# Or pick a mode up front:
+python cli.py --text "كِتَابٌ" --mode irab --audio clip.wav
 ```
 
-First run downloads the wav2vec2 model (~1.2 GB) from HuggingFace Hub into `~/.cache/huggingface/`. To avoid that, see [Installation](#installation-fresh-setup) below.
+First run downloads the active backend's model from HuggingFace Hub into `~/.cache/huggingface/`. To avoid that, see [Installation](#installation-fresh-setup).
 
-Or use the wrapper script (after step 4):
-
-```bash
-chmod +x start.sh stop.sh
-./start.sh            # interactive CLI (default)
-./start.sh api        # API server on port 8000
-./start.sh test       # batch tests
-```
+---
 
 ## How It Works
 
 ```
-                       ┌── phrasebook.json (if entry exists) ──┐
-Arabic Text ──┼────────┤                                        ├─► Target Phonemes ─┐
-              │        └── CAMeL Tools MLE (G2P fallback) ──────┘                    │
-              │                                                                     ├─► Edit Distance ──► Accuracy %
-              │                                                  Target Phonemes ──┘
-              │                                                  (user-corrected)
-Audio WAV ────┼──► wav2vec2 CTC ────► Recognized Phonemes ──────────────────────────┘
+                         ┌── phrasebook.json (if entry exists) ──┐
+Arabic Text ──┼──────────┤                                        ├──► Target Phonemes ──┐
+              │          └── CAMeL Tools MLE (G2P fallback) ───────┘                      │
+              │                                                                          ├──► Edit Distance ──► Accuracy %
+              │                                                       Target Phonemes ──┘
+              │                                                       (user-corrected)
+Audio WAV ────┼──► [pluggable backend] ──► Recognized Phonemes ─────────────────────────┘
+                   wav2vec2 / tarteel /
+                   <your model here>
 ```
 
-**Target resolution order:** phrasebook (user-corrected) → CAMeL G2P (auto-generated) → manual override (caller-provided). See [Manual Target & Phrasebook](#manual-target--phrasebook) below.
+1. **Text → phonemes (G2P).** Arabic text is morphologically analyzed via CAMeL Tools MLE Disambiguator (`calima-msa-r13`), producing phonemes from the `caphi` field. Example: `كتاب` → `k i t aa b i`.
+2. **Audio → phonemes (ASR).** The active **backend** recognizes phonemes from recorded audio. Each backend is free to do this however it likes — direct CTC decoding, ASR + G2P, or anything else — as long as it returns a list of phoneme strings.
+3. **Comparison.** The two phoneme lists are aligned using Levenshtein edit distance, classifying errors as substitutions, insertions, or deletions.
 
-1. **Text to phonemes (G2P)** — Arabic text is morphologically analyzed via CAMeL Tools MLE Disambiguator (`calima-msa-r13`), producing phonemes from the `caphi` field (e.g. `كتاب` → `k i t aa b i`).
-2. **Audio to phonemes (ASR)** — A wav2vec2 model (`MostafaMaroof/wav2vec2-arabic-phoneme-asr`) recognizes phonemes from the recorded audio using CTC decoding.
-3. **Comparison** — The two phoneme lists are aligned using edit distance (Levenshtein), classifying errors as substitutions, insertions, or deletions.
+**Target resolution order:** phrasebook (user-corrected) → CAMeL G2P (auto-generated) → manual override (caller-provided). See [Manual Target & Phrasebook](#manual-target--phrasebook).
 
-## Usage Modes
+---
 
-### 1. Interactive CLI
+## Usage
 
-Prompts for Arabic text and audio source (file or record):
+### Interactive CLI
 
 ```bash
-./start.sh cli
-# or
-python cli.py
+python cli.py                      # prompts for text + audio source
+python cli.py --mode irab          # start in irab mode
 ```
 
-### 2. One-liner CLI
+### One-liner CLI
 
 ```bash
-# Assess existing audio file
+# Assess existing audio
 python cli.py --text "كتاب" --audio test_audio/clip.wav
 
-# Record 3 seconds then assess
+# Record 3 seconds, then assess
 python cli.py --text "كتاب" --record 3
 
-# JSON output (for scripts)
+# Explicit mode + backend
+python cli.py --text "كِتَابٌ" --mode irab --backend tarteel --audio clip.wav
+
+# JSON output for scripting
 python cli.py --text "كتاب" --audio clip.wav --json
 ```
 
-### 3. API Server
+### API Server
 
 ```bash
-./start.sh api                 # http://localhost:8000
-./start.sh api --port 9000     # custom port
+./start.sh api                        # http://localhost:8000
+./start.sh api --port 9000            # custom port
+./start.sh api --mode irab            # default server mode = irab
 ```
 
-**Browser UI:** Open `http://localhost:8000/` for a simple upload interface.
-
-**REST endpoint:**
+Open `http://localhost:8000/` for a small browser UI, or call the REST endpoint directly:
 
 ```bash
 curl -X POST http://localhost:8000/assess \
   -F "text=كتاب" \
-  -F "audio=@test_audio/clip.wav"
+  -F "audio=@test_audio/clip.wav" \
+  -F "mode=irab"           # optional per-request override
 ```
 
 Response:
 ```json
 {
   "text": "كتاب",
+  "mode": "everyday",
+  "backend": "wav2vec2",
   "accuracy": 83.33,
   "target_phonemes": ["k", "i", "t", "aa", "b", "i"],
   "recognized_phonemes": ["k", "i", "t", "aa", "b"],
@@ -106,17 +134,172 @@ Response:
     "insertions": [],
     "deletions": ["i"]
   },
-  "total_errors": 1
+  "total_errors": 1,
+  "target_source": "g2p"
 }
 ```
 
-### 4. Batch Test
+Inspect available modes and backends:
 
-Run multiple test cases defined in `test_pronunciation.py`:
+```bash
+curl http://localhost:8000/modes
+# {
+#   "modes": ["everyday", "irab"],
+#   "backends": {
+#     "wav2vec2": {"modes": ["everyday"], "default_for": "everyday", ...},
+#     "tarteel":  {"modes": ["irab"],     "default_for": "irab",     ...}
+#   }
+# }
+```
+
+### Batch Tests
 
 ```bash
 ./start.sh test
 ```
+
+---
+
+## Adding a New Backend
+
+This is the core extensibility point. The goal: try a new ASR model without forking the assessment logic, CLI, or API.
+
+### The contract
+
+Every backend is just **two methods on `PronunciationEngine`**:
+
+| Method                       | Job                                                          | Required? |
+|------------------------------|--------------------------------------------------------------|-----------|
+| `_load_<name>(self, ...)`    | Load model weights, processor, etc. Store them on `self`.    | yes       |
+| `_recognize_<name>(self, audio_path)` | Take a WAV path, return a list of phoneme strings.  | yes       |
+
+That's it. The loader runs once during engine init; the recognizer runs once per assessment. Everything else (text normalization, G2P, edit distance, accuracy scoring, error breakdown) is shared infrastructure.
+
+Shared helpers available inside any backend:
+
+- `self._load_audio(path)` → `(float32 numpy array, sample_rate)` — handles mono conversion + 16 kHz resampling
+- `self.device` — `torch.device("cuda" if available else "cpu")`
+- `self.text_to_phonemes(text, preserve_harakat=...)` — run CAMeL G2P on Arabic text (handy for backends that output text rather than phonemes)
+- `self._log(msg)` — print only if `verbose=True`
+
+### Step-by-step: add a backend
+
+**1. Register it** in `backend_registry.py`:
+
+```python
+BACKENDS = {
+    # ...existing entries...
+
+    "nemo": {
+        "modes": ["irab"],            # which modes can use this
+        "default_for": None,          # set to "irab" to make it the default
+        "loader": "_load_nemo",       # method name on PronunciationEngine
+        "recognizer": "_recognize_nemo",
+        "dependencies": ["nemo_toolkit"],
+        "description": "NVIDIA NeMo FastConformer diacritized ASR",
+    },
+}
+```
+
+**2. Implement the two methods** in `pronunciation_engine.py`:
+
+```python
+def _load_nemo(self, **kwargs):
+    """Load NeMo model once at engine init."""
+    # Import heavy deps lazily so unrelated backends don't pay the cost
+    import nemo_toolkit.asr as nemo_asr
+
+    self._log("Loading NeMo FastConformer...")
+    self.nemo_model = nemo_asr.models.ASRModel.from_pretrained(
+        "nvidia/ar_fastconformer_transducer_large"
+    )
+    self.nemo_model = self.nemo_model.to(self.device)
+    self.nemo_model.eval()
+
+def _recognize_nemo(self, audio_path):
+    """Audio → diacritized text → CAMeL G2P → phonemes."""
+    try:
+        audio_data, sample_rate = self._load_audio(audio_path)
+
+        # NeMo wants a file path; write the resampled audio to a temp wav
+        import tempfile, soundfile as sf
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, audio_data, sample_rate)
+            tmp_path = tmp.name
+        try:
+            text = self.nemo_model.transcribe([tmp_path])[0].text.strip()
+        finally:
+            os.unlink(tmp_path)
+
+        if not text:
+            return []
+
+        # Same trick as the tarteel backend: route through CAMeL G2P so
+        # the recognized phonemes use the SAME notation as the target.
+        return self.text_to_phonemes(text, preserve_harakat=True)
+    except Exception as e:
+        print(f"Audio recognition error (nemo): {e}")
+        return []
+```
+
+**3. Use it.** No other files need to change — CLI, API, and tests pick up the new backend automatically:
+
+```bash
+# CLI
+python cli.py --text "كِتَابٌ" --mode irab --backend nemo --audio clip.wav
+
+# API
+curl -X POST http://localhost:8000/assess \
+  -F "text=كِتَابٌ" \
+  -F "audio=@clip.wav" \
+  -F "mode=irab" \
+  -F "backend=nemo"
+
+# It also shows up in the introspection endpoint:
+curl http://localhost:8000/modes
+python cli.py --list-backends
+```
+
+### Design notes for backend authors
+
+- **Output notation matters.** Both target and recognized phonemes go through the same edit-distance comparison, so they must use the same phoneme inventory. Two safe options:
+  - Output raw phonemes in **CAMeL `caphi` notation** (matching what CAMeL G2P produces for the target).
+  - Output Arabic text and call `self.text_to_phonemes(text)` — the engine runs it through CAMeL, guaranteeing a matching notation. The `tarteel` backend does this.
+- **Fail soft, fail loud.** Wrap the recognition body in `try/except` and return `[]` on failure (so one bad audio file doesn't crash a batch run), but `print()` the underlying error so it's visible.
+- **Lazy imports.** Put `import` statements for backend-specific libraries inside the loader method. This keeps `pip install -r requirements.txt` light and means adding a backend doesn't force every user to install its deps.
+- **No model reloads.** Load weights once in `_load_<name>`; the engine caches the instance across requests. The API server also caches one `PronunciationEngine` per `(mode, backend)` tuple.
+
+### Roadmap: candidates we haven't wired in yet
+
+The registry has commented-out slots for several candidates we've been evaluating. Each is one PR away:
+
+| Candidate   | Approach                                            | Notes |
+|-------------|-----------------------------------------------------|-------|
+| `aras2p`    | Purpose-built phoneme mispronunciation detector     | Direct phoneme output, no G2P detour |
+| `nemo`      | NVIDIA NeMo FastConformer diacritized ASR           | Fast GPU inference, high quality |
+| `whisper-t` | OpenAI Whisper large-v3 + Arabic linguistics        | General ASR, would need a diacritization step |
+
+---
+
+## Built-in Backends
+
+### `wav2vec2` — phoneme-level ASR (default for `everyday`)
+
+- **Model:** `MostafaMaroof/wav2vec2-arabic-phoneme-asr` (~1.2 GB, safetensors)
+- **Pipeline:** raw audio → wav2vec2 CTC → phoneme tokens (direct, no G2P detour)
+- **Output:** phonemes in the model's own vocabulary, which happens to align with CAMeL `caphi`
+- **Latency:** ~2 s per 3 s clip on CPU
+- **Local cache:** drop the weights into `model_cache/` and the engine auto-detects them
+
+### `tarteel` — diacritized ASR (default for `irab`)
+
+- **Model:** `tarteel-ai/whisper-base-ar-quran` (Whisper fine-tuned on Quranic Arabic)
+- **Pipeline:** raw audio → Whisper → diacritized Arabic text → CAMeL G2P → phonemes
+- **Output:** phonemes in CAMeL `caphi` notation (guaranteed match with the target)
+- **Why the G2P detour?** Whisper outputs Arabic *text*, not phonemes. Running that text through CAMeL G2P produces phonemes in the same vocabulary the target uses, eliminating the apples-to-oranges comparison problem.
+- **Compatibility note:** the model ships with an outdated `generation_config`. We call `generate()` without `language=`/`task=` kwargs (the model is already fine-tuned for Arabic) and manually strip the `<|ar|><|transcribe|><|notimestamps|>` prefix tokens. See `_recognize_tarteel` in `pronunciation_engine.py`.
+
+---
 
 ## Manual Target & Phrasebook
 
@@ -127,10 +310,10 @@ Say It Right lets you override the target phonemes in three ways:
 ### Option A — Pass a manual target (one-off)
 
 ```bash
-# CLI: skip G2P entirely, provide your own phoneme list
+# CLI
 python cli.py --audio clip.wav --target "k,i,t,aa,b"
 
-# API: same thing via form field
+# API
 curl -X POST http://localhost:8000/assess \
   -F "target=k,i,t,aa,b" \
   -F "audio=@test_audio/clip.wav"
@@ -139,7 +322,6 @@ curl -X POST http://localhost:8000/assess \
 ### Option B — Edit interactively, save to phrasebook
 
 ```bash
-# Show auto-generated target, edit in $EDITOR, save for future runs
 python cli.py --text "كتاب" --audio clip.wav --edit-target --save-target
 ```
 
@@ -178,20 +360,20 @@ Every `assess(text=...)` call checks `phrasebook.json` **first**. If the text is
 
 The browser UI at `http://localhost:8000/` has a **"Get Phonemes"** button to auto-generate, an editable field to correct, and a **"Save to Phrasebook"** button to persist.
 
-## Recording Audio
+---
 
-Use the built-in recorder:
+## Recording Audio
 
 ```bash
 ./start.sh record test_audio/clip.wav 3    # record 3 seconds
 ```
 
-Or any external tool. Audio requirements:
+Or use any external tool. Audio requirements:
 - Format: WAV
 - Sample rate: any (auto-resampled to 16 kHz)
 - Channels: mono or stereo (auto-converted)
 
-**To enable recording**, install sounddevice:
+To enable in-app recording:
 
 ```bash
 pip install sounddevice
@@ -199,112 +381,108 @@ pip install sounddevice
 sudo dnf install portaudio-devel
 ```
 
-If your recordings are silent, check that the microphone is not muted at the OS level:
+If your recordings are silent, check the OS microphone state:
 
 ```bash
 wpctl status          # look for "MUTED" next to your microphone source
 wpctl set-mute <ID> 0 # unmute by ID
 ```
 
+---
+
 ## Technical Details
 
-### Models Used
+### CAMeL Tools — MLE Disambiguator (`calima-msa-r13`)
 
-#### 1. CAMeL Tools — MLE Disambiguator (`calima-msa-r13`)
+A Maximum Likelihood Estimation morphological disambiguator for Modern Standard Arabic, part of the [CAMeL Tools](https://github.com/CAMeL-Lab/camel_tools) library.
 
-**What it is:** A Maximum Likelihood Estimation morphological disambiguator for Modern Standard Arabic, part of the [CAMeL Tools](https://github.com/CAMeL-Lab/camel_tools) library. It analyzes Arabic text morphologically and selects the most likely analysis for each word.
-
-**Why this approach:** Earlier versions of CAMeL Tools (pre-1.5) included a dedicated `G2P` class that directly converted text to phonemes. In version 1.6.0 (the current release), this class no longer exists. Instead, G2P is achieved through morphological disambiguation: the disambiguator returns a rich analysis for each word, including a `caphi` (CAMeL Phonetic) field that contains the phonemic transcription.
-
-**How phonemes are extracted:**
+Earlier versions of CAMeL Tools (pre-1.5) included a dedicated `G2P` class. In 1.6.0 it no longer exists; instead, G2P is done through morphological disambiguation. The disambiguator returns a rich analysis per word including a `caphi` (CAMeL Phonetic) field:
 
 ```python
 mle = MLEDisambiguator.pretrained('calima-msa-r13')
 results = mle.disambiguate(['كتاب'])  # → "book"
 
-# The analysis dict contains:
+# analysis dict contains:
 #   'caphi': 'k_i_t_aa_b_i'     ← phonemes separated by underscores
 #   'gloss': 'book+[def.gen.]'
 #   'pos':   'noun'
 #   'root':  'ktb'
 
-# Split on '_' to get individual phonemes
 phonemes = results[0].analyses[0].analysis['caphi'].split('_')
 # → ['k', 'i', 't', 'aa', 'b', 'i']
 ```
 
-The `caphi` representation uses a custom phoneme inventory where:
+The `caphi` inventory:
 - Short vowels: `a`, `i`, `u`
 - Long vowels: `aa`, `ii`, `uu`
-- Emphatic consonants are distinct from non-emphatic (e.g. `t` vs `T`)
+- Emphatic consonants distinct from non-emphatic (e.g. `t` vs `T`)
 - Pharyngeal consonants: `2` (hamza), `3` (ayn), `7` (ha), `kh`, `gh`, `q`
 
-**Data download:** Requires `camel_data -i light` which downloads the `disambig-mle-calima-msa-r13` database (~36 MB).
-
-#### 2. Wav2Vec2 — Arabic Phoneme ASR (`MostafaMaroof/wav2vec2-arabic-phoneme-asr`)
-
-**What it is:** A fine-tuned Wav2Vec2 model (originally from Facebook AI) trained specifically to recognize Arabic phonemes from raw audio waveforms. It uses CTC (Connectionist Temporal Classification) decoding, meaning it doesn't need pre-aligned audio-text pairs during training.
-
-**Why this model:**
-- Directly outputs phonemes (not Arabic script), making it ideal for pronunciation assessment
-- Fine-tuned on Arabic speech data
-- Lightweight (~1.2 GB) compared to larger ASR models
-- Runs efficiently on CPU (~2 seconds per 3-second clip)
-
-**Architecture:** Wav2Vec2 uses a multi-layer transformer encoder that processes raw audio at 16 kHz. The model was pre-trained on self-supervised speech representations (learning from unlabeled audio) then fine-tuned with CTC loss on labeled phoneme data. The output is a probability distribution over ~40 phoneme tokens for each time step, which is then collapsed (removing repeats and blanks) into the final phoneme sequence.
-
-**Format:** The model is distributed in `safetensors` format (not `pytorch_model.bin`), which is faster to load and more secure than pickle-based formats.
+Requires `camel_data -i light` (~36 MB database).
 
 ### Audio Loading — Why not torchaudio?
 
-This project uses `soundfile` (libsndfile backend) for audio I/O instead of `torchaudio.load()`. The reason:
-
-Torchaudio 2.11+ changed its default backend to `torchcodec`, a separate package that requires additional system dependencies. Without `torchcodec` installed, `torchaudio.load()` raises `ImportError: TorchCodec is required`. Since `soundfile` was already a dependency (used by the recording helper) and handles WAV reading perfectly, we use it directly:
+We use `soundfile` (libsndfile backend) instead of `torchaudio.load()`. Torchaudio 2.11+ switched its default backend to `torchcodec`, a separate package requiring extra system deps. `soundfile` was already a dependency (recording helper) and handles WAV reading perfectly:
 
 ```python
-# Instead of torchaudio.load():
-audio_data, sample_rate = sf.read(audio_path)  # soundfile
+audio_data, sample_rate = sf.read(audio_path)
 ```
 
-Resampling to 16 kHz (when needed) is done with `numpy.interp`, which is sufficient for speech-quality audio and avoids pulling in `torchaudio.transforms.Resample` or `scipy.signal.resample`.
+Resampling to 16 kHz (when needed) uses `numpy.interp`, sufficient for speech-quality audio.
 
-### Comparison Algorithm — Levenshtein Edit Distance
+### Comparison — Levenshtein Edit Distance
 
-The phoneme comparison uses dynamic programming (Wagner-Fischer algorithm) to compute the minimum edit distance between the target and recognized phoneme sequences, then backtracks through the DP table to classify each edit as:
+Dynamic programming (Wagner-Fischer) computes the minimum edit distance between target and recognized phoneme sequences, then backtracks through the DP table to classify each edit:
 
-| Error type | Meaning | Example |
-|-----------|---------|---------|
-| **Substitution** | Wrong phoneme spoken | target `aa` → recognized `a` |
-| **Insertion** | Extra phoneme added | recognized `s` not in target |
-| **Deletion** | Expected phoneme missing | target `i` not found in audio |
+| Error type       | Meaning                    | Example                              |
+|------------------|----------------------------|--------------------------------------|
+| **Substitution** | Wrong phoneme spoken       | target `aa` → recognized `a`         |
+| **Insertion**    | Extra phoneme added        | recognized `s` not in target         |
+| **Deletion**     | Expected phoneme missing   | target `i` not found in audio        |
 
 Accuracy = `(1 - total_errors / len(target_phonemes)) * 100`
 
-### Architecture
+---
+
+## Architecture
 
 ```
 pronunciation_engine.py   ← Core logic (PronunciationEngine class)
-                              ├─ text_to_phonemes()      — CAMeL MLE → caphi
-                              ├─ get_target_phonemes()   — phrasebook → G2P fallback
-                              ├─ assess_with_target()    — manual target (skip G2P)
-                              ├─ audio_to_phonemes()     — soundfile + wav2vec2
-                              ├─ compare_phonemes()      — edit distance
-                              └─ assess()                — full pipeline
+                              ├─ _load_<name>()         — one per backend (lazy init)
+                              ├─ _recognize_<name>()    — one per backend (audio → phonemes)
+                              ├─ audio_to_phonemes()    — dispatcher, routes to active backend
+                              ├─ text_to_phonemes()     — CAMeL MLE → caphi
+                              ├─ get_target_phonemes()  — phrasebook → G2P fallback
+                              ├─ assess_with_target()   — manual target (skip G2P)
+                              ├─ compare_phonemes()     — edit distance
+                              └─ assess()               — full pipeline
+│
+├── backend_registry.py   ← Backend routing (add new backends here)
+│                             ├─ BACKENDS dict           — registry of all backends
+│                             ├─ resolve_backend()       — mode + override → backend name
+│                             └─ list_modes/backends()   — introspection
 │
 ├── phrasebook.py         ← JSON-backed user corrections (load/save/lookup)
-├── cli.py                ← Interactive + one-liner CLI (--target, --edit-target)
-├── api.py                ← FastAPI server (/assess, /phonemes, browser UI)
+├── cli.py                ← Interactive + one-liner CLI (--mode, --backend, --target, ...)
+├── api.py                ← FastAPI server (/assess, /phonemes, /modes, browser UI)
 ├── test_pronunciation.py ← Batch test runner
 └── record_audio.py       ← Microphone recording helper
 ```
 
-All three interfaces (CLI, API, batch test) import and share the same `PronunciationEngine` class, ensuring identical assessment logic across modes.
+All three interfaces (CLI, API, batch test) import the same `PronunciationEngine`, so adding a backend in `backend_registry.py` + `pronunciation_engine.py` instantly exposes it everywhere.
+
+### Engine caching in the API server
+
+The API server keeps one `PronunciationEngine` per `(mode, backend)` tuple. The default engine loads at startup; other combos build lazily on first request and stay cached. Loading is expensive (multiple GB into RAM), so engines are never rebuilt.
+
+---
 
 ## Project Structure
 
 ```
 say-it-right/
-├── pronunciation_engine.py   # Core assessment logic (shared)
+├── pronunciation_engine.py   # Core assessment logic + backend implementations
+├── backend_registry.py       # Backend routing (the "plugin" registry)
 ├── phrasebook.py             # User-corrected phoneme lookup/save
 ├── cli.py                    # Interactive + one-liner CLI
 ├── api.py                    # FastAPI server with browser UI
@@ -320,14 +498,12 @@ say-it-right/
 └── venv/                     # Python virtual environment        [gitignored]
 ```
 
-Files marked `[gitignored]` are not in the repo — they are created during [Installation](#installation-fresh-setup).
+---
 
 ## Installation (Fresh Setup)
 
-After cloning, `venv/`, `model_cache/`, `test_audio/`, and `results/` do **not** exist (they are gitignored). This section sets everything up from scratch.
-
 ```bash
-# 1. Clone the repository
+# 1. Clone
 git clone git@github.com:HarounOujihi/say-it-right.git
 cd say-it-right
 
@@ -344,11 +520,11 @@ pip install -r requirements.txt
 # 5. Install CAMeL Tools data (~36 MB, stored in ~/.camel_tools)
 camel_data -i light
 
-# 6. Create runtime directories (gitignored, not in repo)
+# 6. Create runtime directories
 mkdir -p test_audio results
 
 # 7. Download the wav2vec2 model (~1.2 GB)
-#    Option A — let the engine auto-download on first run (goes to ~/.cache/huggingface/)
+#    Option A — let the engine auto-download on first run (→ ~/.cache/huggingface/)
 #    Option B — pre-download into model_cache/ (auto-detected, skips HF Hub):
 mkdir -p model_cache && cd model_cache
 curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/resolve/main/model.safetensors
@@ -360,37 +536,39 @@ curl -L -O https://huggingface.co/MostafaMaroof/wav2vec2-arabic-phoneme-asr/reso
 cd ..
 ```
 
-If the `curl` download stalls, add `--retry 30 --retry-delay 5 --retry-all-errors -C -` to resume.
+If `curl` stalls, add `--retry 30 --retry-delay 5 --retry-all-errors -C -` to resume.
 
 ### System Requirements (Fedora)
 
 ```bash
-# For compiling C extensions (editdistance, etc.)
-sudo dnf install -y python3-devel
-
-# For audio recording (optional)
-sudo dnf install -y portaudio-devel
+sudo dnf install -y python3-devel      # for compiling C extensions (editdistance, etc.)
+sudo dnf install -y portaudio-devel    # for audio recording (optional)
 ```
+
+---
 
 ## Dependencies
 
-| Package | Purpose |
-|---------|---------|
-| `camel-tools` | Arabic morphological analysis / G2P via `caphi` field |
-| `transformers` | wav2vec2 model loading and inference |
-| `torch` | Neural network backend (CPU inference) |
-| `soundfile` | WAV file reading (replaces torchaudio) |
-| `fastapi` | API server |
-| `uvicorn` | ASGI server for FastAPI |
-| `python-multipart` | File upload support for API |
-| `sounddevice` | Microphone recording (optional) |
-| `numpy` | Audio resampling and numeric operations |
+| Package           | Purpose                                              |
+|-------------------|------------------------------------------------------|
+| `camel-tools`     | Arabic morphological analysis / G2P via `caphi`      |
+| `transformers`    | wav2vec2 / Whisper model loading and inference       |
+| `torch`           | Neural network backend (CPU inference)               |
+| `soundfile`       | WAV file reading (replaces torchaudio)               |
+| `fastapi`         | API server                                           |
+| `uvicorn`         | ASGI server for FastAPI                              |
+| `python-multipart`| File upload support for API                          |
+| `sounddevice`     | Microphone recording (optional)                      |
+| `numpy`           | Audio resampling and numeric operations              |
+
+---
 
 ## Example Output
 
 ```
 Assessing pronunciation for: 'كتاب'
 Audio file: test_audio/cli_recording.wav
+Mode: everyday  |  Backend: wav2vec2
 
 ==================================================
 ASSESSMENT RESULTS

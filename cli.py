@@ -31,6 +31,20 @@ Usage:
   # Get only the target phoneme array (no audio needed):
   python cli.py --text "كتاب" --phonemes
 
+Modes:
+  # Everyday speech (default — wav2vec2, harakat stripped):
+  python cli.py --text "كتاب" --mode everyday
+
+  # I'rāb / diacritized (harakat preserved, Tarteel Whisper backend):
+  python cli.py --text "كِتَابٌ" --mode irab
+
+  # Explicit backend override (if multiple backends exist for a mode):
+  python cli.py --text "كِتَابٌ" --mode irab --backend tarteel
+
+  # List available modes and backends:
+  python cli.py --list-modes
+  python cli.py --list-backends
+
 Flow:
   1. Resolve target: --target (manual) > phrasebook > CAMeL G2P
   2. Resolve audio:  --audio (file) > --record N > prompt + countdown
@@ -44,6 +58,7 @@ import sys
 from pathlib import Path
 
 from pronunciation_engine import PronunciationEngine
+from backend_registry import list_modes, list_backends, resolve_backend
 
 
 def record_clip(output_path, duration=3.0, countdown=True):
@@ -141,6 +156,13 @@ Examples:
   python cli.py --audio clip.wav --target "k,i,t,aa,b"  # manual target, skip G2P
   python cli.py --text "كتاب" --audio clip.wav --edit-target
   python cli.py --text "كتاب" --phonemes                # print target array only
+
+Modes:
+  python cli.py --text "كتاب" --mode everyday           # default: wav2vec2, harakat stripped
+  python cli.py --text "كِتَابٌ" --mode irab                       # harakat preserved, Tarteel Whisper
+  python cli.py --text "كِتَابٌ" --mode irab --backend tarteel     # explicit backend
+  python cli.py --list-modes                             # show available modes
+  python cli.py --list-backends                          # show available backends
         """,
     )
     parser.add_argument("--text", "-t", type=str, help="Arabic target text")
@@ -171,19 +193,70 @@ Examples:
         help="Print only the target phoneme array for --text and exit "
              "(no audio needed). Checks phrasebook first, falls back to G2P.",
     )
+    parser.add_argument(
+        "--mode", "-m", type=str, default="everyday",
+        choices=list_modes(),
+        help="Assessment mode (default: everyday). "
+             "'everyday': wav2vec2, harakat stripped. "
+             "'irab': harakat preserved, diacritized ASR backend.",
+    )
+    parser.add_argument(
+        "--backend", "-b", type=str, default=None,
+        help="Explicit ASR backend override (default: mode's default backend). "
+             "Use --list-backends to see options.",
+    )
+    parser.add_argument(
+        "--list-modes", action="store_true",
+        help="List available assessment modes and exit.",
+    )
+    parser.add_argument(
+        "--list-backends", action="store_true",
+        help="List available ASR backends and exit.",
+    )
     args = parser.parse_args()
+
+    # --list-modes: print modes and exit
+    if args.list_modes:
+        print("Available modes:")
+        for mode in list_modes():
+            default_backend = resolve_backend(mode)
+            print(f"  {mode}  (default backend: {default_backend})")
+        sys.exit(0)
+
+    # --list-backends: print backends and exit
+    if args.list_backends:
+        print("Available backends:")
+        for name, info in list_backends().items():
+            modes_str = ", ".join(info["modes"])
+            default_marker = " (default)" if info.get("default_for") else ""
+            print(f"  {name}{default_marker}")
+            print(f"    modes:         {modes_str}")
+            print(f"    description:   {info['description']}")
+            print(f"    dependencies:  {', '.join(info['dependencies'])}")
+            print()
+        sys.exit(0)
 
     # Determine text and audio source
     text = args.text
     audio_path = args.audio
     manual_target = parse_target_string(args.target) if args.target else None
 
+    # Validate mode/backend combo early (before recording) so users get a
+    # clean error message instead of a traceback mid-session.
+    try:
+        resolved_backend = resolve_backend(args.mode, args.backend)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     # --phonemes: print target array and exit (no audio needed)
     if args.phonemes:
         if not text:
             print("Error: --phonemes requires --text")
             sys.exit(1)
-        engine = PronunciationEngine(verbose=False)
+        engine = PronunciationEngine(
+            mode=args.mode, backend=args.backend, verbose=False
+        )
         phonemes, source = engine.get_target_phonemes(text)
         if args.json:
             print(json.dumps(phonemes, ensure_ascii=False))
@@ -235,7 +308,9 @@ Examples:
         sys.exit(1)
 
     # Initialize engine
-    engine = PronunciationEngine(verbose=not args.json)
+    engine = PronunciationEngine(
+        mode=args.mode, backend=args.backend, verbose=not args.json
+    )
 
     # Resolve target first (so we can show it before asking user to record)
     if manual_target:

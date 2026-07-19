@@ -7,29 +7,38 @@ Endpoints:
   GET  /phonemes   - Get target phonemes for a text (phrasebook or G2P)
   POST /phonemes   - Save a corrected target to the phrasebook
   GET  /health     - Health check
+  GET  /modes      - List available assessment modes and backends
   GET  /           - Simple HTML test page (browser UI)
 
 Usage:
-  python api.py                   # starts on http://0.0.0.0:8000
-  python api.py --port 9000       # custom port
-  python api.py --host 127.0.0.1  # localhost only
+  python api.py                                # default: everyday mode, wav2vec2
+  python api.py --mode irab                    # boot in irab mode, Tarteel Whisper
+  python api.py --mode irab --backend tarteel  # explicit backend
+  python api.py --port 9000                    # custom port
+  python api.py --host 127.0.0.1               # localhost only
 
 Example (classic — text only, engine runs G2P):
-  curl -X POST http://localhost:8000/assess \
-    -F "text=كتاب" \
+  curl -X POST http://localhost:8000/assess \\
+    -F "text=كتاب" \\
     -F "audio=@test_audio/clip.wav"
 
 Example (manual target — skip G2P entirely):
-  curl -X POST http://localhost:8000/assess \
-    -F "target=k,i,t,aa,b" \
+  curl -X POST http://localhost:8000/assess \\
+    -F "target=k,i,t,aa,b" \\
     -F "audio=@test_audio/clip.wav"
+
+Example (per-request mode override — lazily builds second engine):
+  curl -X POST http://localhost:8000/assess \\
+    -F "text=كِتَابٌ" \\
+    -F "audio=@clip.wav" \\
+    -F "mode=irab"
 
 Example (two-step: generate, correct, then assess):
   curl "http://localhost:8000/phonemes?text=كتاب"
   # → {"text":"كتاب","phonemes":["k","i","t","aa","b","i"],"source":"g2p"}
   # ... user edits ...
-  curl -X POST http://localhost:8000/assess \
-    -F "target=k,i,t,aa,b" \
+  curl -X POST http://localhost:8000/assess \\
+    -F "target=k,i,t,aa,b" \\
     -F "audio=@test_audio/clip.wav"
 """
 
@@ -43,22 +52,81 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 from pronunciation_engine import PronunciationEngine
+from backend_registry import list_modes, list_backends, resolve_backend
 
-# Global engine - loaded once at startup
-engine: PronunciationEngine = None
+# Engine cache: key is (mode, backend) tuple, value is a PronunciationEngine.
+# The default engine is built at startup; others are built lazily on first use.
+_engines: dict[tuple, PronunciationEngine] = {}
+DEFAULT_MODE = "everyday"
+DEFAULT_BACKEND = None  # None → mode's default backend
 
-app = FastAPI(title="Say It Right API", version="1.1")
+
+app = FastAPI(title="Say It Right API", version="1.2")
+
+
+def get_engine(mode: str = None, backend: str = None) -> PronunciationEngine:
+    """Return a cached engine for (mode, backend), building it if needed.
+
+    The first call (at startup) builds the default engine. Subsequent calls
+    with different mode/backend combos lazily build and cache additional
+    engines. Loading is expensive (multiple GB), so we never rebuild.
+    """
+    # Fall back to defaults if not specified
+    mode = mode or DEFAULT_MODE
+    backend = backend or DEFAULT_BACKEND
+
+    # Validate the combo against the registry before building
+    try:
+        resolved = resolve_backend(mode, backend)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    key = (mode, resolved)
+    if key not in _engines:
+        print(f"[api] Building new engine for mode='{mode}' backend='{resolved}'...")
+        _engines[key] = PronunciationEngine(
+            mode=mode, backend=resolved, verbose=True
+        )
+    return _engines[key]
 
 
 @app.on_event("startup")
-def load_engine():
-    global engine
-    engine = PronunciationEngine(verbose=True)
+def load_default_engine():
+    """Pre-load the default engine at startup so the first request is fast."""
+    print(f"[api] Loading default engine (mode={DEFAULT_MODE})...")
+    get_engine(DEFAULT_MODE, DEFAULT_BACKEND)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": engine is not None}
+    return {
+        "status": "ok",
+        "engines_loaded": len(_engines),
+        "default_mode": DEFAULT_MODE,
+        "default_backend": resolve_backend(DEFAULT_MODE, DEFAULT_BACKEND),
+        "cached": [
+            {"mode": m, "backend": b} for (m, b) in _engines.keys()
+        ],
+    }
+
+
+@app.get("/modes")
+def get_modes():
+    """List all available modes and backends."""
+    modes = list_modes()
+    backends = list_backends()
+    return {
+        "modes": modes,
+        "backends": {
+            name: {
+                "modes": info["modes"],
+                "default_for": info.get("default_for"),
+                "description": info["description"],
+                "dependencies": info["dependencies"],
+            }
+            for name, info in backends.items()
+        },
+    }
 
 
 def _parse_target_string(s):
@@ -73,6 +141,8 @@ def _parse_target_string(s):
 def get_phonemes(
     text: str = Query(..., description="Arabic text"),
     raw: bool = Query(False, description="If true, return only the bare phoneme array"),
+    mode: str = Query(None, description="Assessment mode override (e.g. 'irab')"),
+    backend: str = Query(None, description="Explicit ASR backend override"),
 ):
     """Get target phonemes for a text.
 
@@ -81,15 +151,20 @@ def get_phonemes(
 
     With raw=true, returns just the array: ["k","i","t","aa","b"]
     """
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    eng = get_engine(mode, backend)
     if not text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
-    phonemes, source = engine.get_target_phonemes(text)
+    phonemes, source = eng.get_target_phonemes(text)
     if raw:
         return JSONResponse(content=phonemes)
-    return {"text": text, "phonemes": phonemes, "source": source}
+    return {
+        "text": text,
+        "phonemes": phonemes,
+        "source": source,
+        "mode": eng.mode,
+        "backend": eng.backend_name,
+    }
 
 
 @app.post("/phonemes")
@@ -97,9 +172,12 @@ async def save_phonemes(
     text: str = Form(..., description="Arabic text"),
     phonemes: str = Form(..., description="Phoneme list, e.g. 'k,i,t,aa,b'"),
 ):
-    """Save a corrected target phoneme list to the phrasebook."""
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    """Save a corrected target phoneme list to the phrasebook.
+
+    Phrasebook is shared across all modes — the phoneme list is what matters,
+    not which engine produced it. So no mode/backend params here.
+    """
+    eng = get_engine()  # any engine is fine — phrasebook is shared
     if not text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
@@ -107,7 +185,7 @@ async def save_phonemes(
     if not parsed:
         raise HTTPException(status_code=400, detail="phonemes cannot be empty")
 
-    engine.save_target(text, parsed)
+    eng.save_target(text, parsed)
     return {"status": "saved", "text": text, "phonemes": parsed}
 
 
@@ -116,17 +194,23 @@ async def assess(
     audio: UploadFile = File(..., description="WAV audio file"),
     text: str = Form(None, description="Arabic target text (required if target not given)"),
     target: str = Form(None, description="Manual target phonemes, e.g. 'k,i,t,aa,b' (skips G2P)"),
+    mode: str = Form(None, description="Assessment mode override (e.g. 'irab')"),
+    backend: str = Form(None, description="Explicit ASR backend override"),
 ):
     """Assess pronunciation from uploaded audio.
 
-    Two modes:
+    Two target sources:
       1. text=كتاب            → engine runs G2P (or phrasebook lookup)
       2. target=k,i,t,aa,b    → skips G2P, uses the provided phoneme list
 
     Either text or target must be provided. If both are given, target wins.
+
+    Mode/backend: omit to use the server's default engine. Pass mode=irab
+    (or mode=irab&backend=tarteel) to assess against a different engine.
+    First use of a new mode/backend is slow (model loading); subsequent
+    requests are fast (cached).
     """
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    eng = get_engine(mode, backend)
 
     parsed_target = _parse_target_string(target) if target else None
 
@@ -146,13 +230,15 @@ async def assess(
     try:
         if parsed_target:
             # Manual target path
-            result = engine.assess_with_target(
+            result = eng.assess_with_target(
                 parsed_target, tmp_path, text=text or "", verbose=False
             )
         else:
             # Standard path — G2P or phrasebook lookup
-            result = engine.assess(text, tmp_path, verbose=False)
+            result = eng.assess(text, tmp_path, verbose=False)
         return JSONResponse(content=result)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -170,7 +256,7 @@ def index():
         <meta charset="utf-8">
         <style>
             body { font-family: sans-serif; max-width: 700px; margin: 40px auto; }
-            input, button { font-size: 16px; margin: 4px 0; }
+            input, button, select { font-size: 16px; margin: 4px 0; }
             #text { width: 100%; padding: 8px; font-size: 20px; }
             #target { width: 100%; padding: 8px; font-family: monospace; }
             #audio { width: 100%; }
@@ -178,10 +264,25 @@ def index():
             .hint { color: #666; font-size: 13px; margin-bottom: 8px; }
             #result { margin-top: 20px; white-space: pre-wrap;
                       background: #f0f0f0; padding: 16px; border-radius: 8px; }
+            .mode-row { display: flex; gap: 12px; align-items: center;
+                        margin-top: 12px; margin-bottom: 8px; }
+            .mode-row label { font-weight: bold; }
         </style>
     </head>
     <body>
         <h2>Say It Right</h2>
+
+        <div class="mode-row">
+          <label>Mode:</label>
+          <select id="mode" onchange="onModeChange()">
+            <option value="">(server default)</option>
+          </select>
+          <label>Backend:</label>
+          <select id="backend" onchange="onBackendChange()">
+            <option value="">(mode default)</option>
+          </select>
+        </div>
+        <div class="hint" id="mode-hint"></div>
 
         <label>Arabic text:</label>
         <input type="text" id="text" placeholder="كتاب" dir="rtl">
@@ -205,17 +306,65 @@ def index():
         <div id="result"></div>
 
         <script>
+        // Fetch modes/backends on page load and populate dropdowns
+        async function loadModes() {
+            try {
+                const res = await fetch('/modes');
+                const data = await res.json();
+                const modeSel = document.getElementById('mode');
+                const backendSel = document.getElementById('backend');
+                data.modes.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    modeSel.appendChild(opt);
+                });
+                Object.keys(data.backends).forEach(b => {
+                    const opt = document.createElement('option');
+                    opt.value = b;
+                    opt.textContent = b + ' (' + data.backends[b].modes.join(', ') + ')';
+                    backendSel.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load modes:', e);
+            }
+        }
+        loadModes();
+
+        function onModeChange() {
+            const mode = document.getElementById('mode').value;
+            const hint = document.getElementById('mode-hint');
+            if (mode === 'irab') {
+                hint.textContent = 'irab: harakat preserved (case endings matter). Backend: Tarteel Whisper.';
+            } else if (mode === 'everyday') {
+                hint.textContent = 'everyday: harakat stripped (case endings optional). Backend: wav2vec2.';
+            } else {
+                hint.textContent = '';
+            }
+        }
+        function onBackendChange() { /* no-op, used for future hints */ }
+
+        function getSelectedMode() { return document.getElementById('mode').value; }
+        function getSelectedBackend() { return document.getElementById('backend').value; }
+
         async function getPhonemes() {
             const text = document.getElementById('text').value.trim();
             if (!text) { alert('Enter Arabic text first'); return; }
             document.getElementById('result').textContent = 'Generating phonemes...';
             try {
-                const url = '/phonemes?text=' + encodeURIComponent(text);
+                let url = '/phonemes?text=' + encodeURIComponent(text);
+                const mode = getSelectedMode();
+                const backend = getSelectedBackend();
+                if (mode) url += '&mode=' + encodeURIComponent(mode);
+                if (backend) url += '&backend=' + encodeURIComponent(backend);
                 const res = await fetch(url);
                 const data = await res.json();
                 document.getElementById('target').value = data.phonemes.join(' ');
                 document.getElementById('result').textContent =
-                    'Source: ' + data.source + '\\nPhonemes: ' + JSON.stringify(data.phonemes);
+                    'Source: ' + data.source +
+                    (data.mode ? '  |  Mode: ' + data.mode : '') +
+                    (data.backend ? '  |  Backend: ' + data.backend : '') +
+                    '\\nPhonemes: ' + JSON.stringify(data.phonemes);
             } catch (e) {
                 document.getElementById('result').textContent = 'Error: ' + e;
             }
@@ -251,7 +400,13 @@ def index():
             } else {
                 fd.append('text', text);
             }
-            document.getElementById('result').textContent = 'Assessing...';
+            const mode = getSelectedMode();
+            const backend = getSelectedBackend();
+            if (mode) fd.append('mode', mode);
+            if (backend) fd.append('backend', backend);
+
+            document.getElementById('result').textContent = 'Assessing' +
+                (mode ? ' (mode=' + mode + ')' : '') + '...';
             try {
                 const res = await fetch('/assess', { method: 'POST', body: fd });
                 const data = await res.json();
@@ -271,11 +426,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Say It Right API Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
+    parser.add_argument(
+        "--mode", default=None,
+        choices=list_modes(),
+        help="Default assessment mode (default: everyday).",
+    )
+    parser.add_argument(
+        "--backend", default=None,
+        help="Default ASR backend (default: mode's default).",
+    )
     args = parser.parse_args()
 
+    # Apply the CLI-selected defaults (override the module-level constants)
+    if args.mode:
+        DEFAULT_MODE = args.mode
+    if args.backend:
+        DEFAULT_BACKEND = args.backend
+
     print(f"Starting API server on http://{args.host}:{args.port}")
-    print(f"  Browser UI:  http://localhost:{args.port}/")
-    print(f"  Health:      http://localhost:{args.port}/health")
-    print(f"  Phonemes:    GET  http://localhost:{args.port}/phonemes?text=كتاب")
-    print(f"  Assess:      POST http://localhost:{args.port}/assess")
+    print(f"  Default mode:    {DEFAULT_MODE}")
+    print(f"  Default backend: {resolve_backend(DEFAULT_MODE, DEFAULT_BACKEND)}")
+    print(f"  Browser UI:      http://localhost:{args.port}/")
+    print(f"  Modes list:      http://localhost:{args.port}/modes")
+    print(f"  Health:          http://localhost:{args.port}/health")
+    print(f"  Phonemes:        GET  http://localhost:{args.port}/phonemes?text=كتاب")
+    print(f"  Assess:          POST http://localhost:{args.port}/assess")
     uvicorn.run(app, host=args.host, port=args.port)
